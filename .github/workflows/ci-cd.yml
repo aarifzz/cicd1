@@ -1,0 +1,312 @@
+name: 🚀 CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, staging]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: '20'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Code Quality Gates
+  # ─────────────────────────────────────────────
+  quality:
+    name: 🔍 Quality Gates
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+            app/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci --prefer-offline
+
+      - name: Run ESLint
+        working-directory: app
+        run: npm run lint
+
+      - name: Run TypeScript type check
+        working-directory: app
+        run: npm run type-check
+
+      - name: Run unit tests with coverage
+        working-directory: app
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: app/coverage/
+          retention-days: 7
+
+      - name: Check coverage thresholds
+        working-directory: app
+        run: npm run test:coverage:check
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Security Scan
+  # ─────────────────────────────────────────────
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: quality
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run dependency audit
+        working-directory: app
+        run: npm audit --audit-level=high
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Build Docker Image
+  # ─────────────────────────────────────────────
+  build:
+    name: 🏗️ Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [quality, security]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          elif [[ "${{ github.ref }}" == refs/heads/main ]]; then
+            VERSION="latest"
+          else
+            VERSION="${{ github.sha }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Version: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VERSION=${{ steps.version.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          artifact-name: sbom.spdx.json
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Deploy to DEV
+  # ─────────────────────────────────────────────
+  deploy-dev:
+    name: 🌱 Deploy → DEV
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'pull_request'
+    environment:
+      name: development
+      url: https://dev.yourapp.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run DB migrations (dev)
+        run: |
+          bash scripts/migrate.sh dev
+        env:
+          DB_URL: ${{ secrets.DEV_DB_URL }}
+
+      - name: Deploy to Dev
+        run: |
+          bash scripts/deploy.sh dev ${{ needs.build.outputs.version }}
+        env:
+          KUBE_CONFIG: ${{ secrets.DEV_KUBE_CONFIG }}
+          APP_SECRET: ${{ secrets.DEV_APP_SECRET }}
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh https://dev.yourapp.com
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"❌ DEV deployment failed for ${{ github.sha }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Deploy to STAGING
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: 🧪 Deploy → STAGING
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/staging'
+    environment:
+      name: staging
+      url: https://staging.yourapp.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run DB migrations (staging)
+        run: bash scripts/migrate.sh staging
+        env:
+          DB_URL: ${{ secrets.STAGING_DB_URL }}
+
+      - name: Deploy to Staging
+        run: bash scripts/deploy.sh staging ${{ needs.build.outputs.version }}
+        env:
+          KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
+          APP_SECRET: ${{ secrets.STAGING_APP_SECRET }}
+
+      - name: Run integration tests
+        run: bash scripts/integration-test.sh https://staging.yourapp.com
+
+      - name: Run load tests
+        run: bash scripts/load-test.sh https://staging.yourapp.com
+
+  # ─────────────────────────────────────────────
+  # JOB 6: Deploy to PRODUCTION (gated)
+  # ─────────────────────────────────────────────
+  deploy-prod:
+    name: 🚀 Deploy → PRODUCTION
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://yourapp.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create deployment record
+        id: deployment
+        run: |
+          echo "deployment_id=$(date +%s)" >> $GITHUB_OUTPUT
+          echo "🚀 Starting production deployment: ${{ needs.build.outputs.version }}"
+
+      - name: Snapshot DB before migration
+        run: bash scripts/db-snapshot.sh prod
+        env:
+          DB_URL: ${{ secrets.PROD_DB_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run DB migrations (prod)
+        run: bash scripts/migrate.sh prod
+        env:
+          DB_URL: ${{ secrets.PROD_DB_URL }}
+
+      - name: Blue-Green Deploy to Production
+        id: deploy
+        run: bash scripts/deploy-bluegreen.sh prod ${{ needs.build.outputs.version }}
+        env:
+          KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
+          APP_SECRET: ${{ secrets.PROD_APP_SECRET }}
+
+      - name: Run smoke tests on new release
+        run: bash scripts/smoke-test.sh https://yourapp.com
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "💥 Deploy failed. Rolling back..."
+          bash scripts/rollback.sh prod
+        env:
+          KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
+
+      - name: Notify success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"✅ Production deployed: ${{ needs.build.outputs.version }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"🔴 PRODUCTION deployment FAILED and was rolled back: ${{ needs.build.outputs.version }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

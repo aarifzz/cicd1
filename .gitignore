@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+app/node_modules/
+
+# Build output
+dist/
+app/dist/
+*.js.map
+
+# Environment — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Coverage
+coverage/
+app/coverage/
+*.lcov
+
+# Docker
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Kubernetes secrets (never commit)
+kubeconfig
+*.kubeconfig
+k8s/secrets/
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+.tmp/

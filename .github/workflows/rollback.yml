@@ -1,0 +1,54 @@
+name: 🔄 Manual Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options: [production, staging, development]
+      version:
+        description: 'Version to rollback to (e.g. v1.2.3 or sha-abc123)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: 🔄 Rollback ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log rollback intent
+        run: |
+          echo "🔄 Rollback requested"
+          echo "  Environment : ${{ inputs.environment }}"
+          echo "  Target ver  : ${{ inputs.version }}"
+          echo "  Reason      : ${{ inputs.reason }}"
+          echo "  Initiated by: ${{ github.actor }}"
+
+      - name: Execute rollback
+        run: bash scripts/rollback.sh ${{ inputs.environment }} ${{ inputs.version }}
+        env:
+          KUBE_CONFIG: ${{ secrets[format('{0}_KUBE_CONFIG', upper(inputs.environment))] }}
+
+      - name: Verify rollback
+        run: bash scripts/smoke-test.sh ${{ inputs.environment }}
+
+      - name: Notify team
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔄 *Rollback executed* on *${{ inputs.environment }}* to `${{ inputs.version }}` by @${{ github.actor }}\nReason: ${{ inputs.reason }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
